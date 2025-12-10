@@ -11,7 +11,7 @@ Attention Output [B, T, d] → [Pre-Norm] → MLP (z_mlp1 → z_mlp2) → [Resid
 ```
 
 **Components:**
-- **MLP Block**: Expansion (d → d_ff) then contraction (d_ff → d)
+- **MLP Block**: Expansion (d → d_ff) then contraction (d_ff → d) Note: d_ff = 4*d
 - **Language Head**: Projects to vocabulary size V
 - **Normalization**: Optional pre-norm and post-norm
 - **Residual**: Optional skip connection
