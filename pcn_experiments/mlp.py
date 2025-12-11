@@ -7,32 +7,36 @@ import ngclearn.utils.weight_distribution as dist
 
 
 class SimplePCNMLP:
-    """2-Layer Predictive-Coding MLP Block + Output Layer for Transformer Decoder.
+    """5-Layer Predictive-Coding MLP Block for Transformer Decoder.
 
-    This module contains:
-    1. MLP Block: Processes attention block output through 2 hidden layers
-    2. Output Layer: Language modeling head that produces vocabulary logits
+    This module contains a 5-layer predictive coding network:
+    1. z_mlp1: First hidden layer (stateful, expansion) - receives attention as top-down error
+    2. z_mlp2: Second hidden layer (stateful, intermediate)
+    3. z_mlp3: Third layer (stateless, contraction)
+    4. z_output: Fourth layer (stateless, model dimension)
+    5. z_target: Final layer (stateless, vocabulary) - clamped during training
     
-    Structure:
-    - Pre-norm : Layer normalization before MLP
-    - z_mlp1: first hidden layer (stateful, expansion) - receives attention output directly
-      Dimension: d_ff (typically 4×d, e.g., 3072)
-    - z_mlp2: second hidden layer (stateful, contraction)
-      Dimension: d (back to model dimension, e.g., 768)
-
-    - Post-norm : Layer normalization after MLP, before language head
-    - z_out: output layer (stateless) - produces vocabulary logits
-      Dimension: V (vocabulary size, e.g., 50257)
+    Architecture:
+    - z_mlp1: [B, T, d_ff] (stateful, tau_m>0) - receives attention via j_td
+    - z_mlp2: [B, T, d_ff2] (stateful, tau_m>0)
+    - z_mlp3: [B, T, d] (stateless, tau_m=0)
+    - z_output: [B, T, d] (stateless, tau_m=0)
+    - z_target: [B, T, V] (stateless, tau_m=0) - CLAMPED ONLY
     
     Flow:
-    attention_output → [pre-norm] → MLP (z_mlp1 → z_mlp2 → z_mlp_out) → [post-norm] → Language Head (z_out)
+    Attention → z_mlp1 → z_mlp2 → z_mlp3 → z_output → z_target
     
-    Note: Attention output is received directly (no separate input layer needed
-    since attention block is already implemented by other team members).
+    Error Computation (4 error cells):
+    - e1: W1.outputs vs z_mlp2.z
+    - e2: W2.outputs vs z_mlp3.z
+    - e3: W3.outputs vs z_output.z
+    - e_out: W_out.outputs vs z_target.z
     
-    Generative synapses (W1, W2, W_out) predict activity in the next layer.
-    Gaussian error cells compute prediction errors.
-    Static synapses pass feedback signals downward.
+    Key Features:
+    - Attention provides only top-down error to z_mlp1 (no input clamping)
+    - W1 exists for error computation but not used in forward pass
+    - z_target has no error dynamics - only clamped during training
+    - 3 feedback synapses: E2, E3, E_out (no E_target)
     """
     def __init__(self, dkey, input_dim=768, hidden1_dim=None, hidden2_dim=None, vocab_size=50257, 
                  learning_rate=0.001, activation="gelu", T_inference=10, tau_m=10.,
@@ -96,7 +100,7 @@ class SimplePCNMLP:
             self.z_mlp3 = RateCell("z_mlp3", n_units=self.output_dim, tau_m=0., act_fx="linear")
 
             # Output layer: stateless layer (d dimension)
-            self.z_output = RateCell("z_output", n_units=self.output_dim, tau_m=0., act_fx="linear")
+            self.z_output = RateCell("z_output", n_units=self.input_dim, tau_m=0., act_fx="linear")
 
             # Target layer: stateless layer that produces vocabulary logits
             self.z_target = RateCell("z_target", n_units=self.vocab_size, tau_m=0., act_fx="softmax")
@@ -106,13 +110,12 @@ class SimplePCNMLP:
             self.e2 = GaussianErrorCell("e2", n_units=self.hidden2_dim)
             self.e3 = GaussianErrorCell("e3", n_units=self.output_dim)
             self.e_out = GaussianErrorCell("e_out", n_units=self.output_dim)
-            self.e_target = GaussianErrorCell("e_target", n_units=self.vocab_size)
 
-            # Generative synapses: 
-            # W1: expands from d to d_ff (predicts z_mlp2 from z_mlp1)
-            # W2: projects from d_ff to d_ff2 (predicts z_mlp3 from z_mlp2)
-            # W3: projects from d_ff2 back to d (predicts z_output from z_mlp3)
-            # W_out: projects from d to V (predicts z_target from z_output)
+            # Generative synapses (4 total):
+            # W1: [d, d_ff] - NOT used in forward pass, only for error computation
+            # W2: [d_ff, d_ff2] - z_mlp1 → z_mlp2 (predicts z_mlp3 from z_mlp2)
+            # W3: [d_ff2, d] - z_mlp2 → z_mlp3 (predicts z_output from z_mlp3)
+            # W_out: [d, V] - z_output → z_target (predicts z_target from z_output)
             wlb, wub = -0.1, 0.1
             self.W1 = HebbianSynapse(
                 "W1", shape=(self.input_dim, self.hidden1_dim), eta=learning_rate,
@@ -127,13 +130,13 @@ class SimplePCNMLP:
             )
 
             self.W3 = HebbianSynapse(
-                "W3", shape=(self.hidden2_dim, self.output_dim), eta=learning_rate,
+                "W3", shape=(self.hidden2_dim, self.input_dim), eta=learning_rate,
                 weight_init=dist.uniform(amin=wlb, amax=wub), bias_init=dist.constant(value=0.),
                 optim_type="adam", sign_value=-1., key=k3
             )
 
             self.W_out = HebbianSynapse(
-                "W_out", shape=(self.output_dim, self.vocab_size), eta=learning_rate,
+                "W_out", shape=(self.input_dim, self.vocab_size), eta=learning_rate,
                 weight_init=dist.uniform(amin=wlb, amax=wub), bias_init=dist.constant(value=0.),
                 optim_type="adam", sign_value=-1., key=k4
             )
@@ -146,44 +149,26 @@ class SimplePCNMLP:
                                     weight_init=dist.uniform(amin=wlb, amax=wub), key=k5)
             self.E_out = StaticSynapse("E_out", shape=(self.output_dim, self.hidden2_dim), 
                                        weight_init=dist.uniform(amin=wlb, amax=wub), key=k6)
-            self.E_target = StaticSynapse("E_target", shape=(self.vocab_size, self.output_dim), 
-                                          weight_init=dist.uniform(amin=wlb, amax=wub), key=k7)
-
-            # Wiring: generative forward predictions
-            # W1: attention → z_mlp1 (d → d_ff)
-            # Note: W1.inputs will be set directly from attention output
+            # Wiring: generative forward predictions (corrected)
+            # W1: z_mlp1 → e1 (for error computation only, no forward pass)
+            self.W1.inputs << self.z_mlp1.zF
             self.e1.mu << self.W1.outputs
-            self.e1.target << self.z_mlp1.z
+            self.e1.target << self.z_mlp2.z  # e1 compares W1 prediction vs z_mlp2
 
-            # W2: z_mlp1 → z_mlp2 (d_ff → d_ff2)
-            self.W2.inputs << self.z_mlp1.zF
+            # W2: z_mlp1 → z_mlp2 (actual forward connection)
+            self.W2.inputs << self.z_mlp1.zF  # CORRECTED: was z_mlp2.zF
             self.e2.mu << self.W2.outputs
-            self.e2.target << self.z_mlp2.z
+            self.e2.target << self.z_mlp2.z   # CORRECTED: was z_mlp3.z
 
-            # W3: z_mlp2 → z_mlp3 (d_ff2 → d)
-            self.W3.inputs << self.z_mlp2.zF
+            # W3: z_mlp2 → z_mlp3
+            self.W3.inputs << self.z_mlp2.zF  # CORRECTED: was z_mlp3.zF
             self.e3.mu << self.W3.outputs
-            self.e3.target << self.z_mlp3.z
+            self.e3.target << self.z_mlp3.z   # CORRECTED: was z_output.z
 
-            # W3: z_mlp2 → z_mlp3 (d_ff → d_ff2)
-            self.W3.inputs << self.z_mlp2.zF
-            self.e3.mu << self.W3.outputs
-            self.e3.target << self.z_mlp3.z
-
-            # W_out: z_mlp3 → z_output (d_ff2 → d)
-            self.W_out.inputs << self.z_mlp3.zF
+            # W_out: z_mlp3 → z_target
+            self.W_out.inputs << self.z_mlp3.zF  # CORRECTED: was z_output.zF
             self.e_out.mu << self.W_out.outputs
-            self.e_out.target << self.z_output.z
-
-            # W_target: z_output → z_target (d → V)
-            self.W_target = HebbianSynapse(
-                "W_target", shape=(self.output_dim, self.vocab_size), eta=learning_rate,
-                weight_init=dist.uniform(amin=wlb, amax=wub), bias_init=dist.constant(value=0.),
-                optim_type="adam", sign_value=-1., key=k7
-            )
-            self.W_target.inputs << self.z_output.zF
-            self.e_target.mu << self.W_target.outputs
-            self.e_target.target << self.z_target.z
+            self.e_out.target << self.z_target.z
 
             # Feedback/error propagation into neuronal currents
             # z_mlp1 receives feedback from e2 (via E2) and its own local error e1
@@ -201,34 +186,25 @@ class SimplePCNMLP:
             self.z_mlp3.j << self.E_out.outputs
             self.z_mlp3.j_td << self.e3.dtarget
 
-            # z_output receives feedback from e_target (via E_target) and its own local error e_out
-            self.E_target.inputs << self.e_target.dmu
-            self.z_output.j << self.E_target.outputs
-            self.z_output.j_td << self.e_out.dtarget
-
-            # z_target only receives its own local error e_target (no feedback from below)
-            self.z_target.j_td << self.e_target.dtarget
-
             # Hebbian learning signals for synapses
-            # W1.pre will be set directly from attention output
+            # W1: No pre-synaptic signal set (not used in forward pass)
             self.W1.post << self.e1.dmu
             
+            # W2: z_mlp1 → z_mlp2 learning
             self.W2.pre << self.z_mlp1.zF
             self.W2.post << self.e2.dmu
 
+            # W3: z_mlp2 → z_mlp3 learning
             self.W3.pre << self.z_mlp2.zF
             self.W3.post << self.e3.dmu
 
+            # W_out: z_mlp3 → z_target learning
             self.W_out.pre << self.z_mlp3.zF
             self.W_out.post << self.e_out.dmu
-
-            self.W_target.pre << self.z_output.zF
-            self.W_target.post << self.e_target.dmu
 
             # Processes: reset, advance (E-step), and learn (M-step)
             reset_process = (
                 JaxProcess(name="reset_process")
-
                 >> self.z_mlp1.reset
                 >> self.z_mlp2.reset
                 >> self.z_mlp3.reset
@@ -238,16 +214,13 @@ class SimplePCNMLP:
                 >> self.e2.reset
                 >> self.e3.reset
                 >> self.e_out.reset
-                >> self.e_target.reset
                 >> self.W1.reset
                 >> self.W2.reset
                 >> self.W3.reset
                 >> self.W_out.reset
-                >> self.W_target.reset
                 >> self.E2.reset
                 >> self.E3.reset
                 >> self.E_out.reset
-                >> self.E_target.reset
             )
 
             advance_pcn_state_process = (
@@ -264,12 +237,10 @@ class SimplePCNMLP:
                 >> self.W2.advance_state
                 >> self.W3.advance_state
                 >> self.W_out.advance_state
-                >> self.W_target.advance_state
                 >> self.e1.advance_state
                 >> self.e2.advance_state
                 >> self.e3.advance_state
                 >> self.e_out.advance_state
-                >> self.e_target.advance_state
             )
 
             learn_process = (
@@ -278,7 +249,6 @@ class SimplePCNMLP:
                 >> self.W2.evolve
                 >> self.W3.evolve
                 >> self.W_out.evolve
-                >> self.W_target.evolve
             )
 
             # Expose commands on the context
@@ -294,7 +264,7 @@ class SimplePCNMLP:
 
             @Context.dynamicCommand
             def clamp_target_output(y):
-                """Clamp target vocabulary (one-hot or logits) to output layer during training."""
+                """Clamp target vocabulary (one-hot) to output layer during training."""
                 self.z_target.j.set(y)
 
     def _layer_norm(self, x, gamma, beta):
@@ -316,24 +286,30 @@ class SimplePCNMLP:
         return gamma * normalized + beta
 
     def forward(self, attention_output):
-        """Forward pass: process attention output through MLP and output layer.
-        
-        This is the main method for inference in the transformer architecture.
-        Processes attention block output through MLP and produces vocabulary logits.
+        """Forward pass: process attention output through 5-layer PCN architecture.
         
         Flow:
-        1. Pre-norm : normalize attention output
-        2. MLP Block: z_mlp1 → z_mlp2 → z_mlp_out
-        3. Post-norm : normalize before language head
-        4. Language Head: z_mlp_out → z_out
+        1. Pre-norm: normalize attention output
+        2. Set attention as top-down error to z_mlp1 (j_td connection)
+        3. Run E-step: settle all layers through predictive coding dynamics
+        4. Return z_target output (vocabulary logits)
+        
+        Architecture Flow:
+        Attention → z_mlp1 → z_mlp2 → z_mlp3 → z_output → z_target
+        
+        Key Points:
+        - Attention provides only top-down error (no input clamping)
+        - W1 not used in forward pass (only for error computation)
+        - All layers settle through predictive coding dynamics
+        - z_target produces final vocabulary logits
 
         Args:
             attention_output: Input tensor from attention block
                Shape: (batch, seq_len, input_dim)
 
         Returns:
-            Vocabulary logits from output layer.
-            Shape: (batch, seq_len, vocab_size) or (batch, vocab_size)
+            Vocabulary logits from z_target layer.
+            Shape: (batch, seq_len, vocab_size)
         """
         # Step 1: Pre-norm (normalize attention output before MLP)
         if self.use_pre_norm:
@@ -351,26 +327,14 @@ class SimplePCNMLP:
         # Initialize stateful hidden layers to zeros and run E-step settling
         self.z_mlp1.z.set(jnp.zeros_like(self.z_mlp1.z.value))
         self.z_mlp2.z.set(jnp.zeros_like(self.z_mlp2.z.value))
-        self.z_mlp_out.z.set(jnp.zeros_like(self.z_mlp_out.z.value))
+        self.z_mlp3.z.set(jnp.zeros_like(self.z_mlp3.z.value))
+        self.z_output.z.set(jnp.zeros_like(self.z_output.z.value))
+        self.z_target.z.set(jnp.zeros_like(self.z_target.z.value))
         for ts in range(self.T_inference):
             self.circuit.advance_pcn(t=ts, dt=1.)
 
-        # Step 3: Get MLP output
-        mlp_output = self.z_mlp_out.zF.value
-        
-        # Step 4: Post-norm (normalize MLP output before language head)
-        if self.use_post_norm:
-            mlp_output = self._layer_norm(mlp_output, self.ln2_gamma, self.ln2_beta)
-        
-        # Step 5: Process through language head
-        self.W_out.inputs.set(mlp_output)
-        self.W_out.pre.set(mlp_output)
-        self.W_out.advance_state(t=0., dt=1.)
-        self.e_out.advance_state(t=0., dt=1.)
-        self.z_out.advance_state(t=0., dt=1.)
-
-        # Return vocabulary logits from output layer
-        return self.z_out.zF.value
+        # Return vocabulary logits from target layer
+        return self.z_target.zF.value
 
     def predict(self, attention_output):
         """Alias for forward() for backward compatibility."""
@@ -409,23 +373,11 @@ class SimplePCNMLP:
         # Initialize stateful hidden layers to zeros and run E-step
         self.z_mlp1.z.set(jnp.zeros_like(self.z_mlp1.z.value))
         self.z_mlp2.z.set(jnp.zeros_like(self.z_mlp2.z.value))
-        self.z_mlp_out.z.set(jnp.zeros_like(self.z_mlp_out.z.value))
+        self.z_mlp3.z.set(jnp.zeros_like(self.z_mlp3.z.value))
+        self.z_output.z.set(jnp.zeros_like(self.z_output.z.value))
+        self.z_target.z.set(jnp.zeros_like(self.z_target.z.value))
         for ts in range(self.T_inference):
             self.circuit.advance_pcn(t=ts, dt=1.)
-
-        # Step 3: Get MLP output
-        mlp_output = self.z_mlp_out.zF.value
-        
-        # Step 4: Post-norm (normalize MLP output before language head)
-        if self.use_post_norm:
-            mlp_output = self._layer_norm(mlp_output, self.ln2_gamma, self.ln2_beta)
-        
-        # Step 5: Update language head
-        self.W_out.inputs.set(mlp_output)
-        self.W_out.pre.set(mlp_output)
-        self.W_out.advance_state(t=0., dt=1.)
-        self.e_out.advance_state(t=0., dt=1.)
-        self.z_out.advance_state(t=0., dt=1.)
 
         # Expected Free Energy (sum of local losses)
         EFE = self.e1.L.value + self.e2.L.value + self.e3.L.value + self.e_out.L.value
@@ -433,7 +385,7 @@ class SimplePCNMLP:
         # M-step: update synapses
         self.circuit.learn(t=0., dt=1.)
 
-        return self.z_out.zF.value, EFE
+        return self.z_target.zF.value, EFE
 
 
 # Example usage
